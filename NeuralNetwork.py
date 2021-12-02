@@ -34,10 +34,12 @@ class NeuralNetwork:
             |-W_initials            STRING              How to initialize weights. At the init stage, this only saves to a variable because not all dimensions are known yet.
             |-basis                 STRING              Data transformation. E.g. include squares or other functions of the data to learn.
             |   none, poly[power].
-            |   e.g.: poly3 to use x +x^2 +x^3
+            |   e.g.: poly3 to use x +x^2 +x^3. Constant term is always included even when not using poly basis.
             |-regularizer           STRING              How to limit the values of parameters
-            |  linear, squared
-            |-error_method                              How to calculate error. crossentropy: for classification; mse: for regression.
+            |  sum, squaresum
+            |-error_method          STRING              How to calculate error. crossentropy: for classification; mse: for regression.
+            |-dynamiclearn          STRING              How to control the learning rate.
+            |   none/off/false, momentum
         """
 
         # *dimension means the size of the ordered tuple used to represent one data point.
@@ -83,15 +85,17 @@ class NeuralNetwork:
         self.error_method=options.get("error_method", "crossentropy")
 
         # Parameters relating to transformations and analysis including methods and the methods' parameters
-        self.regularizer=options.get("regularizer", None)
+        self.regularizer=options.get("regularizer", None)           # How to regularize parameters
 
-        self.basis=options.get("basis", None)
+        self.basis=options.get("basis", None)                       # How to transform input data.
         
         self.activation_steepness=options.get("activation_steepness", 1)
         assert self.activation_steepness>0
-        self.learnrate=learnrate
-        
-
+        self.base_learnrate=learnrate                               # base learning rate. If dynamiclearn is off, this will be the actual learning rate.
+        self.learn_rate=None                                        # actual learning rate used during gradient descent.
+        self.dynamic_learn=options.get("dynamiclearn", False)
+        self.descent_history=[]                                      # previous descent step. Used in dynamiclearn: e.g. when learn rate is controlled by previous desent step in gradient descent with momentum
+        self.momentum_decay=options.get("momentum_decay", 0.6)
         # Above are ALL the instance variables ######################################
         return None
 
@@ -137,7 +141,6 @@ class NeuralNetwork:
                     build=np.concatenate((build, np.power(input, p)), axis=1)
                 return build
 
-            
 
     def regularize(self, params=None):
         """gets regularization term of one parameter"""
@@ -154,6 +157,7 @@ class NeuralNetwork:
         1/(1+exp(-sx))          - logistic
         tanh(sx)                - hyperbolic tangent
         sx                      - ReLU
+        none, identity, i       - no "activation"
         """
         if activation_override==None:
             activation=self.activation
@@ -168,6 +172,8 @@ class NeuralNetwork:
             return np.maximum(0, steepness*input)
         elif activation=="relu1":
             return np.minimum(1, np.maximum(0, steepness*input))
+        elif activation=="none" or activation=="identity" or activation=="i":
+            return steepness*input
     
     def activation_derivative(self, input, activation_override=None):
         """
@@ -188,6 +194,8 @@ class NeuralNetwork:
             return steepness*(input>=0)
         elif activation=="relu1":
             return steepness*((1*input>=0)*(1*input<=1))
+        elif activation=="none" or activation=="identity" or activation=="i":
+            return steepness
 
     #########################################################################
 
@@ -239,11 +247,13 @@ class NeuralNetwork:
             elif self.W_initials=="xavier":
                 self.W.append(np.random.rand(self.dimensions[layer-1], self.dimensions[layer])*np.sqrt(1/self.dimensions[layer-1]))
             elif self.W_initials=="ones":
-                self.W.append(np.ones((self.dimensions[layer-1], self.dimensions[layer]))+0.0000001)
+                self.W.append(np.ones((self.dimensions[layer-1], self.dimensions[layer])))
+            self.descent_history.append(0)
 
             # adding small value to biases to activate ReLU. Got this off the internet.
             #self.b.append(np.zeros((self.datasize, self.dimensions[layer]))+0.0001)
         self.initialized=True
+
         return self.W
 
 #########################################
@@ -275,6 +285,8 @@ class NeuralNetwork:
 
             # K(W, b) error with respect to weights and biases.
             r=self.h[-1] # r: result
+            self.learn_rate=self.base_learnrate
+ 
 
             #############################################################################################################
             # error and starting propagation (with error's gradient)
@@ -285,8 +297,9 @@ class NeuralNetwork:
                 propagated_gradient=-1*np.divide(self.y, r)+np.divide((1-self.y), (1-r))
             elif self.error_method=="mse":
                 main_term=np.sum(np.square(np.subtract(r, self.y)))/self.datasize
+                #print("main_term", main_term)
                 propagated_gradient=2*(r-self.y)
-            regularization_term=self.regularize()*self.learnrate
+            regularization_term=self.regularize()*self.learn_rate
             self.error.append(main_term+regularization_term)
 
             
@@ -299,10 +312,15 @@ class NeuralNetwork:
             for l in range(len(self.W)-1, 0, -1):
                 assert propagated_gradient.shape==self.a[l].shape # sanity check
                 propagated_gradient=np.multiply(propagated_gradient, self.activation_derivative(self.a[l]))
-                error_derivative_wrt_W_l=np.matmul(self.h[l-1].T, propagated_gradient)#+self.learnrate*self.regularize() ################################################################# TODO Backprop not implemented
-                self.W[l]=np.subtract(self.W[l], self.learnrate*error_derivative_wrt_W_l) # update weights
+                error_derivative_wrt_W_l=np.matmul(self.h[l-1].T, propagated_gradient)#+self.learn_rate*self.regularize() ################################################################# TODO Backprop not implemented
+                if self.dynamic_learn=="momentum":
+                    error_derivative_wrt_W_l-=self.descent_history[l-1]*self.momentum_decay
+                    self.descent_history[l-1]=error_derivative_wrt_W_l
+
+                self.W[l]=np.subtract(self.W[l], self.learn_rate*error_derivative_wrt_W_l) # update weights
                 propagated_gradient=np.matmul(propagated_gradient, self.W[l].T)
 
+                
             self.iterations+=1
         # CHECK ACTIVATION VARIABLE TYPE. LIST OR STRING
 
@@ -349,16 +367,17 @@ class NeuralNetwork:
         print(self.h[-1])
         return None
     
-    def errorhistory(self):
+    def errorhistory(self, historylength=None, by=1):
         """prints error history"""
         print("\n############################################# error history")
-        for v in self.error:
-            if -v >1000:
-                print(str(-v).split(".")[0]+",")
+        if historylength==None or historylength>len(self.error): historylength=len(self.error)
+        for v in range(-historylength, -1, by):
+            if -self.error[v] >1000:
+                print(str(-self.error[v]).split(".")[0]+",")
             else:
-                print(str(-v)[:8]+",")
+                print(str(-self.error[v])[:8]+",")
 
-    
+
 def binary():
     b=NeuralNetwork([3], learnrate=1, W_initials="he")
     b.receive([[1, 3], [2, 2], [1, 1]], [[0, 1, 1], [1, 1, 0], [1, 0, 0]])
@@ -368,14 +387,15 @@ def binary():
     #b.errorhistory()
 
 def regression():
-    b=NeuralNetwork([3], learnrate=0.05, W_initials="random", error_method="mse", activation="relu")
+    b=NeuralNetwork([3], learnrate=0.001, W_initials="he", activation="i", error_method="mse", dynamic_learn="momentum")
     b.receive([[0.5], [1.1], [2]], [[2.75], [3.97], [4]])
-    b.train(1000)
-    b.params()
+    b.train(2000)
+    #b.params()
     print("predict")
     print(b.predict([[0], [1], [3]]))
-    b.error[-1]
-    
+    b.errorhistory(100, 10)
 
-regression()
+#regression()
 #binary()
+
+# gradient descent with momentum broken
